@@ -97,10 +97,11 @@ class FileTransferSocket:
         return packet
     
     def _create_data_packet(self, seq_num, data):
-        """Create a data packet with sequence number and chunk data"""
-        # Packet format: [type(1)|seq_num(4)|data_len(2)|data]
+        """Create a data packet with sequence number, checksum, and chunk data"""
+        # Packet format: [type(1)|seq_num(4)|data_len(2)|checksum(4)|data]
         data_len = len(data)
-        packet = struct.pack('!BIH', self.PKT_DATA, seq_num, data_len)
+        checksum = sum(data) & 0xFFFFFFFF  # Simple checksum
+        packet = struct.pack('!BIHI', self.PKT_DATA, seq_num, data_len, checksum)
         packet += data
         
         return packet
@@ -129,7 +130,15 @@ class FileTransferSocket:
             # Parse data packet
             seq_num = struct.unpack('!I', packet[1:5])[0]
             data_len = struct.unpack('!H', packet[5:7])[0]
-            data = packet[7:7+data_len]
+            checksum = struct.unpack('!I', packet[7:11])[0]
+            data = packet[11:11+data_len]
+            
+            # Verify checksum
+            computed_checksum = sum(data) & 0xFFFFFFFF
+            if computed_checksum != checksum:
+                # Corrupted packet - return None to indicate error
+                return pkt_type, None
+            
             return pkt_type, (seq_num, data)
         
         elif pkt_type == self.PKT_ACK:
@@ -195,7 +204,7 @@ class FileTransferSocket:
                 if addr == self.peer_addr:
                     pkt_type, ack_num = self._parse_packet(data)
                     if pkt_type == self.PKT_ACK:
-                        if ack_num > self.send_base:
+                        if ack_num >= self.send_base and ack_num > self.last_ack:
                             # New ACK received
                             self.send_base = ack_num + 1
                             self.dup_ack_count = 0
@@ -207,7 +216,7 @@ class FileTransferSocket:
                             else:
                                 self.cwnd += 1.0 / self.cwnd
                                 
-                        elif ack_num == self.last_ack:
+                        elif ack_num == self.last_ack and self.last_ack >= 0:
                             self.dup_ack_count += 1
                             
                             # Fast retransmit on 3 duplicate ACKs
@@ -227,6 +236,136 @@ class FileTransferSocket:
         # Send EOF packet
         eof_pkt = self._create_eof_packet()
         self.sock.sendto(eof_pkt, self.peer_addr)
+        
+        return True
+    
+    def send_file_with_errors(self, filepath, corrupt_packets=None, drop_packets=None):
+        """Send a file with intentional errors to test Go-Back-N retransmission. """
+        if corrupt_packets is None:
+            corrupt_packets = []
+        if drop_packets is None:
+            drop_packets = []
+            
+        if not self.connected or not self.peer_addr:
+            return False
+        
+        if not os.path.exists(filepath):
+            return False
+        
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
+        
+        # Send metadata packet
+        metadata_pkt = self._create_metadata_packet(filename, filesize)
+        self.sock.sendto(metadata_pkt, self.peer_addr)
+        
+        # Reset flow control and congestion control state
+        self.send_base = 0
+        self.next_seq_num = 0
+        self.cwnd = self.INITIAL_CWND
+        self.ssthresh = self.SSTHRESH_INIT
+        self.dup_ack_count = 0
+        self.last_ack = -1
+        
+        # Read entire file into chunks
+        chunks = []
+        with open(filepath, 'rb') as f:
+            while True:
+                chunk = f.read(self.CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        
+        total_chunks = len(chunks)
+        self.sock.settimeout(0.1)
+        
+        # Track statistics
+        packets_sent = 0
+        packets_corrupted = 0
+        packets_dropped = 0
+        retransmissions = 0
+        already_errored = set()  # Track packets that have already been corrupted/dropped once
+        
+        # Send chunks with intentional errors
+        while self.send_base < total_chunks:
+            effective_window = min(int(self.cwnd), self.RECV_WINDOW_SIZE)
+            
+            # Send packets within effective window
+            while self.next_seq_num < total_chunks and \
+                  self.next_seq_num < self.send_base + effective_window:
+                
+                seq = self.next_seq_num
+                
+                # Only apply errors on first transmission
+                if seq in drop_packets and seq not in already_errored:
+                    # Simulate packet drop (don't send) - only on first attempt
+                    packets_dropped += 1
+                    already_errored.add(seq)
+                    print(f"[ERROR] Dropped packet {seq}")
+                elif seq in corrupt_packets and seq not in already_errored:
+                    # Corrupt the data by flipping some bytes - only on first attempt
+                    corrupted_chunk = bytearray(chunks[seq])
+                    if len(corrupted_chunk) > 10:
+                        corrupted_chunk[10] ^= 0xFF  # Flip bits at position 10
+                    data_pkt = self._create_data_packet(seq, bytes(corrupted_chunk))
+                    self.sock.sendto(data_pkt, self.peer_addr)
+                    packets_corrupted += 1
+                    packets_sent += 1
+                    already_errored.add(seq)
+                    print(f"[ERROR] Corrupted packet {seq}")
+                else:
+                    # Send normal packet (or retransmission of previously errored packet)
+                    data_pkt = self._create_data_packet(seq, chunks[seq])
+                    self.sock.sendto(data_pkt, self.peer_addr)
+                    packets_sent += 1
+                
+                self.next_seq_num += 1
+            
+            # Wait for ACKs
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                if addr == self.peer_addr:
+                    pkt_type, ack_num = self._parse_packet(data)
+                    if pkt_type == self.PKT_ACK:
+                        if ack_num >= self.send_base and ack_num > self.last_ack:
+                            self.send_base = ack_num + 1
+                            self.dup_ack_count = 0
+                            self.last_ack = ack_num
+                            
+                            if self.cwnd < self.ssthresh:
+                                self.cwnd += 1
+                            else:
+                                self.cwnd += 1.0 / self.cwnd
+                                
+                        elif ack_num == self.last_ack and self.last_ack >= 0:
+                            self.dup_ack_count += 1
+                            
+                            if self.dup_ack_count == 3:
+                                self.ssthresh = max(int(self.cwnd / 2), 2)
+                                self.cwnd = self.ssthresh + 3
+                                print(f"[RETRANSMIT] Fast retransmit from packet {self.send_base}")
+                                retransmissions += 1
+                                self.next_seq_num = self.send_base
+                                
+            except socket.timeout:
+                self.ssthresh = max(int(self.cwnd / 2), 2)
+                self.cwnd = self.INITIAL_CWND
+                self.dup_ack_count = 0
+                print(f"[RETRANSMIT] Timeout, retransmitting from packet {self.send_base}")
+                retransmissions += 1
+                self.next_seq_num = self.send_base
+        
+        self.sock.settimeout(None)
+        
+        # Send EOF packet
+        eof_pkt = self._create_eof_packet()
+        self.sock.sendto(eof_pkt, self.peer_addr)
+        
+        # Print statistics
+        print(f"\n[STATS] Total packets sent: {packets_sent}")
+        print(f"[STATS] Packets corrupted: {packets_corrupted}")
+        print(f"[STATS] Packets dropped: {packets_dropped}")
+        print(f"[STATS] Retransmissions: {retransmissions}")
         
         return True
     
@@ -268,6 +407,12 @@ class FileTransferSocket:
                 break
             
             elif pkt_type == self.PKT_DATA:
+                if content is None:
+                    # Corrupted packet detected - send ACK for last good packet
+                    ack_pkt = self._create_ack_packet(expected_seq - 1 if expected_seq > 0 else -1)
+                    self.sock.sendto(ack_pkt, self.peer_addr)
+                    continue
+                
                 seq_num, chunk = content
                 
                 # Store packet in window
