@@ -247,6 +247,7 @@ class FileTransferSocket:
         packets_dropped = 0
         retransmissions = 0
         already_errored = set()
+        ack_count = 0
         
         while self.send_base < total_chunks:
             effective_window = min(int(self.cwnd), self.RECV_WINDOW_SIZE)
@@ -260,7 +261,7 @@ class FileTransferSocket:
                     if random.random() < drop_rate:
                         packets_dropped += 1
                         already_errored.add(seq)
-                        print(f"[ERROR] Dropped packet {seq}")
+                        print(f"[ERROR] Dropped packet {seq} (cwnd: {self.cwnd:.2f}, ssthresh: {self.ssthresh})")
                         self.next_seq_num += 1
                         continue
                     
@@ -272,7 +273,7 @@ class FileTransferSocket:
                         packets_corrupted += 1
                         packets_sent += 1
                         already_errored.add(seq)
-                        print(f"[ERROR] Corrupted packet {seq}")
+                        print(f"[ERROR] Corrupted packet {seq} (cwnd: {self.cwnd:.2f}, ssthresh: {self.ssthresh})")
                         self.next_seq_num += 1
                         continue
                 
@@ -291,27 +292,33 @@ class FileTransferSocket:
                             self.send_base = ack_num + 1
                             self.dup_ack_count = 0
                             self.last_ack = ack_num
+                            ack_count += 1
                             
                             if self.cwnd < self.ssthresh:
                                 self.cwnd += 1
+                                phase = "Slow Start"
                             else:
                                 self.cwnd += 1.0 / self.cwnd
+                                phase = "Congestion Avoidance"
+                            
                                 
                         elif ack_num == self.last_ack and self.last_ack >= 0:
                             self.dup_ack_count += 1
                             
                             if self.dup_ack_count == 3:
+                                old_cwnd = self.cwnd
                                 self.ssthresh = max(int(self.cwnd / 2), 2)
                                 self.cwnd = self.ssthresh + 3
-                                print(f"[RETRANSMIT] Fast retransmit from packet {self.send_base}")
+                                print(f"[RETRANSMIT] Fast retransmit from packet {self.send_base} (cwnd: {old_cwnd:.1f}→{self.cwnd:.1f}, ssthresh: {self.ssthresh})")
                                 retransmissions += 1
                                 self.next_seq_num = self.send_base
                                 
             except socket.timeout:
+                old_cwnd = self.cwnd
                 self.ssthresh = max(int(self.cwnd / 2), 2)
                 self.cwnd = self.INITIAL_CWND
                 self.dup_ack_count = 0
-                print(f"[RETRANSMIT] Timeout, retransmitting from packet {self.send_base}")
+                print(f"[RETRANSMIT] Timeout, retransmitting from packet {self.send_base} (cwnd: {old_cwnd:.1f}→{self.cwnd:.1f}, ssthresh: {self.ssthresh})")
                 retransmissions += 1
                 self.next_seq_num = self.send_base
         
@@ -320,11 +327,11 @@ class FileTransferSocket:
         eof_pkt = self._create_eof_packet()
         self.sock.sendto(eof_pkt, self.peer_addr)
         
-        print(f"\n[STATS] Total packets sent: {packets_sent}")
-        print(f"[STATS] Packets corrupted: {packets_corrupted}")
-        print(f"[STATS] Packets dropped: {packets_dropped}")
-        print(f"[STATS] Retransmissions: {retransmissions}")
-        
+        print(f"\ntotal packets sent: {packets_sent}")
+        print(f"Packets corrupted: {packets_corrupted}")
+        print(f"Packets dropped: {packets_dropped}")
+        print(f"Retransmissions: {retransmissions}")
+
         return True
     
     def receive_file(self, output_dir='received_files'):

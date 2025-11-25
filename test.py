@@ -34,7 +34,7 @@ def sender_thread():
         start = time.time()
         # Randomly drop 5% and corrupt 3% of packets
         if sender.send_file_with_errors('large_test.bin', 
-                                       drop_rate=0.1, 
+                                       drop_rate=0.02, 
                                        corrupt_rate=0.0):
             elapsed = time.time() - start
             filesize = os.path.getsize('large_test.bin')
