@@ -56,7 +56,7 @@ if __name__ == "__main__":
         import random
         with open('large_test.bin', 'wb') as f:
             f.write(bytes([random.randint(0, 255) for _ in range(1024)]))
-            
+
     receiver = threading.Thread(target=receiver_thread, daemon=True)
     receiver.start()
     sender_thread()
@@ -76,8 +76,8 @@ if __name__ == "__main__":
         orig_size = os.path.getsize('large_test.bin')
         recv_size = os.path.getsize('received_files/large_test.bin')
         
-        print(f"\nOriginal file: {orig_size} bytes, MD5: {orig_hash}")
-        print(f"Received file: {recv_size} bytes, MD5: {recv_hash}")
+        print(f"\nOriginal file: {orig_size} bytes")
+        print(f"Received file: {recv_size} bytes")
         
         if orig_hash == recv_hash:
             print("\nSUCCESS: File transferred correctly")
