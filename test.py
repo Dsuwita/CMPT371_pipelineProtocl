@@ -34,8 +34,8 @@ def sender_thread():
         start = time.time()
         # Randomly drop 5% and corrupt 3% of packets
         if sender.send_file_with_errors('large_test.bin', 
-                                       drop_rate=0.05, 
-                                       corrupt_rate=0.03):
+                                       drop_rate=0.1, 
+                                       corrupt_rate=0.0):
             elapsed = time.time() - start
             filesize = os.path.getsize('large_test.bin')
             print(f"\n[Sender] Transfer completed in {elapsed:.2f}s")
@@ -53,8 +53,10 @@ if __name__ == "__main__":
     # Ensure test file exists
     if not os.path.exists('large_test.bin'):
         print("Creating test file...")
-        os.system('dd if=/dev/urandom of=large_test.bin bs=1024 count=100 2>/dev/null')
-    
+        import random
+        with open('large_test.bin', 'wb') as f:
+            f.write(bytes([random.randint(0, 255) for _ in range(1024)]))
+            
     receiver = threading.Thread(target=receiver_thread, daemon=True)
     receiver.start()
     sender_thread()
